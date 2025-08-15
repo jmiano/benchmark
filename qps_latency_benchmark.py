@@ -110,6 +110,8 @@ class GenResult:
     ok: bool
     status: Optional[int]
     error: Optional[str]
+    response_input_tokens: Optional[int] = None
+    response_output_tokens: Optional[int] = None
 
 
 def _fireworks_headers(api_key: str) -> Dict[str, str]:
@@ -163,8 +165,19 @@ def fireworks_call(
         r = session.post(url, headers=headers, data=json.dumps(payload), timeout=timeout_s)
         latency = time.perf_counter() - t0
         if r.status_code >= 200 and r.status_code < 300:
-            # non-streaming -> just acknowledge success
-            return GenResult(latency_s=latency, ok=True, status=r.status_code, error=None)
+            resp_json = None
+            try:
+                resp_json = r.json()
+            except Exception:
+                resp_json = None
+            in_tok = None
+            out_tok = None
+            if isinstance(resp_json, dict):
+                usage = resp_json.get("usage") or {}
+                in_tok = usage.get("prompt_tokens")
+                out_tok = usage.get("completion_tokens")
+            return GenResult(latency_s=latency, ok=True, status=r.status_code, error=None,
+                             response_input_tokens=in_tok, response_output_tokens=out_tok)
         return GenResult(latency_s=latency, ok=False, status=r.status_code, error=r.text[:2000])
     except Exception as e:
         latency = time.perf_counter() - t0
@@ -177,11 +190,46 @@ def fireworks_call(
 
 
 class SageMakerInvoker:
-    def __init__(self, region_name: str, endpoint_name: str, max_pool_connections: int):
+    def __init__(
+        self,
+        region_name: str,
+        endpoint_name: str,
+        max_pool_connections: int,
+        inference_component_name: Optional[str] = None,
+        api_mode: str = "tgi",  # "tgi" (HF DLC) or "fireworks" (FW container)
+        debug: bool = False,
+    ):
         self.endpoint_name = endpoint_name
+        self.inference_component_name = inference_component_name
+        self.api_mode = api_mode
+        self.debug = debug
         # boto3 clients are thread-safe
         cfg = BotoConfig(max_pool_connections=max(10, max_pool_connections))
         self.runtime = boto3.client("runtime.sagemaker", region_name=region_name, config=cfg)
+        # Try to auto-detect inference component if not provided (for IC-based endpoints)
+        if self.inference_component_name is None:
+            try:
+                sm = boto3.client("sagemaker", region_name=region_name)
+                next_token = None
+                ics = []
+                while True:
+                    kwargs = {"EndpointNameEquals": self.endpoint_name}
+                    if next_token:
+                        kwargs["NextToken"] = next_token
+                    resp = sm.list_inference_components(**kwargs)
+                    ics.extend(resp.get("InferenceComponents") or [])
+                    next_token = resp.get("NextToken")
+                    if not next_token:
+                        break
+                if ics:
+                    self.inference_component_name = ics[0].get("InferenceComponentName")
+                    if self.debug:
+                        print(f"[debug] Using inference component: {self.inference_component_name}")
+            except Exception as e:
+                if self.debug:
+                    print(f"[debug] list_inference_components failed: {e}")
+                # Best-effort only; fall back to classic endpoint invocation
+                self.inference_component_name = None
 
     def call(
         self,
@@ -193,28 +241,72 @@ class SageMakerInvoker:
         top_k: Optional[int],
         timeout_s: int,
     ) -> GenResult:
-        payload: Dict[str, Any] = {
-            # container auto-detects API from keys
-            "prompt": prompt,
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-            "top_p": top_p,
-            "stream": False,
-        }
-        if top_k is not None:
-            payload["top_k"] = top_k
+        if self.api_mode == "tgi":
+            # Hugging Face TGI DLC schema
+            payload: Dict[str, Any] = {
+                "inputs": prompt,
+                "parameters": {
+                    "max_new_tokens": max_tokens,
+                    "min_new_tokens": max_tokens,
+                    "temperature": temperature,
+                    "top_p": top_p,
+                },
+                "stream": False,
+            }
+            if top_k is not None:
+                payload["parameters"]["top_k"] = top_k
+        else:
+            # Fireworks container schema (OpenAI-like)
+            payload = {
+                "prompt": prompt,
+                "max_tokens": max_tokens,
+                "min_tokens": max_tokens,
+                "temperature": temperature,
+                "top_p": top_p,
+                "stream": False,
+            }
+            if top_k is not None:
+                payload["top_k"] = top_k
         t0 = time.perf_counter()
         try:
             # boto3 doesn't expose a direct per-request timeout; rely on client config/env for network timeouts
-            resp = self.runtime.invoke_endpoint(
+            invoke_kwargs = dict(
                 EndpointName=self.endpoint_name,
                 ContentType="application/json",
                 Body=json.dumps(payload),
             )
+            if self.inference_component_name:
+                # SageMaker expects header X-Amzn-SageMaker-Inference-Component-Name via SDK param
+                invoke_kwargs["InferenceComponentName"] = self.inference_component_name
+                if self.debug:
+                    print(f"[debug] invoking IC endpoint with component={self.inference_component_name}")
+            resp = self.runtime.invoke_endpoint(**invoke_kwargs)
             # read body to ensure full roundtrip
-            _ = json.loads(resp["Body"].read().decode())
+            body_text = resp["Body"].read().decode()
+            in_tok = None
+            out_tok = None
+            try:
+                parsed = json.loads(body_text)
+                if self.api_mode == "tgi":
+                    # TGI non-streaming often returns a list with one item containing 'details'
+                    item = parsed[0] if isinstance(parsed, list) and parsed else parsed
+                    details = item.get("details") if isinstance(item, dict) else None
+                    if isinstance(details, dict):
+                        prefill = details.get("prefill")
+                        if isinstance(prefill, list):
+                            in_tok = len(prefill)
+                        out_tok = details.get("generated_tokens")
+                else:
+                    # Fireworks container typically returns OpenAI-like JSON with 'usage'
+                    if isinstance(parsed, dict):
+                        usage = parsed.get("usage") or {}
+                        in_tok = usage.get("prompt_tokens")
+                        out_tok = usage.get("completion_tokens")
+            except Exception:
+                pass
             latency = time.perf_counter() - t0
-            return GenResult(latency_s=latency, ok=True, status=200, error=None)
+            return GenResult(latency_s=latency, ok=True, status=200, error=None,
+                             response_input_tokens=in_tok, response_output_tokens=out_tok)
         except Exception as e:
             latency = time.perf_counter() - t0
             return GenResult(latency_s=latency, ok=False, status=None, error=str(e))
@@ -392,6 +484,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             region_name=args.region,
             endpoint_name=args.fireworks_sagemaker_endpoint,
             max_pool_connections=args.max_workers,
+            api_mode="fireworks",
+            debug=args.debug,
         )
         backends.append(("fireworks-on-sagemaker", {"type": "sagemaker", "invoker": fw_sm_invoker}))
     # sagemaker-on-sagemaker (HF default serving)
@@ -401,6 +495,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             region_name=args.region,
             endpoint_name=args.hf_sagemaker_endpoint,
             max_pool_connections=args.max_workers,
+            api_mode="tgi",
+            debug=args.debug,
         )
         backends.append(("sagemaker-on-sagemaker", {"type": "sagemaker", "invoker": hf_sm_invoker}))
 
@@ -416,6 +512,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     # Containers for results
     rows: List[Dict[str, Any]] = []
+    # Per-request log entries for post-run token distribution checks
+    req_logs: List[Dict[str, Any]] = []
 
     print("Starting benchmark...\n")
     print(f"QPS values: {qps_values}")
@@ -473,7 +571,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     )
             else:
                 def submit_fn(prompt: str) -> GenResult:
-                    return backend_info["invoker"].call(
+                    r = backend_info["invoker"].call(
                         prompt=prompt,
                         max_tokens=args.max_tokens,
                         temperature=args.temperature,
@@ -481,6 +579,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         top_k=args.top_k,
                         timeout_s=args.requests_timeout,
                     )
+                    if args.debug and not r.ok:
+                        print(f"[debug] invoke failed: status={r.status} err={r.error[:200]}...")
+                    return r
 
             # Optional stabilization phase at this QPS (discard results)
             if args.stabilization_seconds and args.stabilization_seconds > 0:
@@ -523,11 +624,32 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 }
             )
 
-    # Save CSV and plot
+            # Append per-request logs for this QPS bucket
+            for r in results:
+                req_logs.append(
+                    {
+                        "backend": backend_name,
+                        "qps": qps,
+                        "ok": r.ok,
+                        "status": r.status,
+                        "latency_ms": r.latency_s * 1000.0,
+                        "input_tokens": r.response_input_tokens,
+                        "output_tokens": r.response_output_tokens,
+                    }
+                )
+
+    # Save CSVs and plot
     df = pd.DataFrame(rows)
     csv_path = os.path.join(out_dir, "qps_latency_results.csv")
     df.sort_values(["backend", "qps"]).to_csv(csv_path, index=False)
     print(f"\nSaved results to {csv_path}")
+
+    # Save per-request log CSV
+    if req_logs:
+        df_logs = pd.DataFrame(req_logs)
+        logs_path = os.path.join(out_dir, "qps_latency_request_logs.csv")
+        df_logs.to_csv(logs_path, index=False)
+        print(f"Saved per-request logs to {logs_path}")
 
     # Pivot for plotting
     # Combined plot: median latency vs QPS for all selected backends
