@@ -7,15 +7,15 @@ Inputs can be:
   - Paths to run directories that contain qps_latency_results.csv
 
 Usage examples:
-  uv run combine_qps_latency_plots.py \
-    --inputs results/qps_latency_20250813_134449 \
-             results/qps_latency_20250813_160052 \
+  uv run benchmark/combine_qps_latency_plots.py \
+    --inputs benchmark/results/qps_latency_20250813_134449 \
+             benchmark/results/qps_latency_20250813_160052 \
     --labels "FW on SM" "SM on SM" \
-    --out results/combined_qps_vs_median_latency.png
+    --out benchmark/results/combined_qps_vs_median_latency.png
 
-  uv run combine_qps_latency_plots.py \
-    --inputs results/qps_latency_20250813_134449/qps_latency_results.csv \
-             results/qps_latency_20250813_160052/qps_latency_results.csv
+  uv run benchmark/combine_qps_latency_plots.py \
+    --inputs benchmark/results/qps_latency_20250813_134449/qps_latency_results.csv \
+             benchmark/results/qps_latency_20250813_160052/qps_latency_results.csv
 
 Legend labels:
   - By default, the legend label is the subdirectory name of each input (run directory name).
@@ -83,6 +83,9 @@ def combine_qps_latency(
     save_merged_csv: Optional[str] = None,
     show_fail_percent: bool = False,
     fail_style: str = "labels",
+    model_name: Optional[str] = None,
+    input_tokens: Optional[int] = None,
+    output_tokens: Optional[int] = None,
 ) -> str:
     """Combine multiple benchmark runs into a single plot.
 
@@ -117,7 +120,7 @@ def combine_qps_latency(
         merged.to_csv(save_merged_csv, index=False)
 
     # Plot
-    fig, ax = plt.subplots(figsize=(8, 5))
+    fig, ax = plt.subplots(figsize=(9, 5.5))
     ax2 = None
     if show_fail_percent and fail_style == "line":
         ax2 = ax.twinx()
@@ -149,7 +152,15 @@ def combine_qps_latency(
         "p95_ms": "P95 total latency (ms)",
     }[y_metric]
     ax.set_ylabel(ylabel)
-    ax.set_title(title)
+    parts = [title]
+    if model_name:
+        parts.append(str(model_name))
+    if input_tokens is not None:
+        parts.append(f"Input Tokens = {int(input_tokens)}")
+    if output_tokens is not None:
+        parts.append(f"Output Tokens = {int(output_tokens)}")
+    final_title = " | ".join(parts)
+    ax.set_title(final_title)
     # Build legend with optional fail% key
     handles, labels = ax.get_legend_handles_labels()
     if show_fail_percent:
@@ -224,6 +235,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--labels", help="Comma-separated labels matching inputs (optional)")
     p.add_argument("--out", help="Output PNG path (optional)")
     p.add_argument("--title", default="QPS vs Latency (combined)")
+    p.add_argument("--model-name", help="Optional model name to append to plot title, e.g., 'Qwen3 8B'")
+    p.add_argument("--input-tokens", type=int, help="Optional input token count to append to title")
+    p.add_argument("--output-tokens", type=int, help="Optional output token count to append to title")
     p.add_argument("--y-metric", default="median_ms", choices=["median_ms", "avg_ms", "p95_ms"])
     p.add_argument("--save-merged-csv", help="Optional path to save merged CSV with 'series' column")
     p.add_argument("--show-fail-percent", action="store_true", help="Show fail rate (%) for each series")
@@ -243,6 +257,9 @@ def main() -> int:
         save_merged_csv=args.save_merged_csv,
         show_fail_percent=bool(args.show_fail_percent),
         fail_style=str(args.fail_style),
+        model_name=args.model_name,
+        input_tokens=args.input_tokens,
+        output_tokens=args.output_tokens,
     )
     print(f"Saved combined plot to {out_path}")
     if args.save_merged_csv:
