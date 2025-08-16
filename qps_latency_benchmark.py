@@ -18,7 +18,7 @@ uv run qps_latency_benchmark.py \
   --fireworks-sagemaker-endpoint endpoint-123 \
   --hf-sagemaker-endpoint my-hf-endpoint \
   --region us-west-2 \
-  --qps-list 0.5,1,2,5,10,20,50,100 \
+  --qps-list 0.5,1,2,5,10,20,50,100,200 \
   --duration-per-qps 20 \
   --results-dir results
 
@@ -29,6 +29,9 @@ Environment:
 
 Dependencies:
   pip install requests boto3 pandas matplotlib
+  # Optional (for robust token counting regardless of server response):
+  # pip install transformers
+  # Then pass --tokenizer-id (e.g., --tokenizer-id Qwen/Qwen3-8B) to count tokens client-side
 """
 
 import argparse
@@ -41,7 +44,7 @@ import sys
 import threading
 import time
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Callable
 
 import boto3
 from botocore.config import Config as BotoConfig
@@ -49,6 +52,19 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import requests
 from requests.adapters import HTTPAdapter
+
+# Optional tokenizer for client-side token counting
+try:
+    from transformers import AutoTokenizer  # type: ignore
+except Exception:  # pragma: no cover
+    AutoTokenizer = None  # type: ignore
+
+class _ThreadLocalContext(threading.local):
+    def __init__(self) -> None:
+        super().__init__()
+        self.token_count_fn: Optional[Callable[[str], int]] = None
+
+thread_local_context = _ThreadLocalContext()
 
 try:
     # Auto-load environment variables from a .env file if present
@@ -112,6 +128,56 @@ class GenResult:
     error: Optional[str]
     response_input_tokens: Optional[int] = None
     response_output_tokens: Optional[int] = None
+    # Capture the prompt length (client-side) to ensure we always know input size sent
+    request_prompt_len_chars: Optional[int] = None
+    # Client-side measured counts (tokenizer-based or whitespace fallback)
+    measured_input_tokens: Optional[int] = None
+    measured_output_tokens: Optional[int] = None
+    # Optional captured texts for debug (not written to CSV)
+    # request_prompt and response_text can help manual inspection when needed
+    # but we avoid storing them for memory/IO. We keep counts only.
+
+
+# ----------------------------
+# Token counting helpers
+# ----------------------------
+
+def _count_tokens(text: Optional[str]) -> Optional[int]:
+    if not text:
+        return None
+    try:
+        fn = getattr(thread_local_context, "token_count_fn", None)
+        if callable(fn):
+            return int(fn(text))
+    except Exception:
+        pass
+    # Fallback: whitespace tokenization
+    try:
+        return len(text.split())
+    except Exception:
+        return None
+
+
+def _extract_tgi_generated_text(parsed: Any) -> Optional[str]:
+    try:
+        item = parsed[0] if isinstance(parsed, list) and parsed else parsed
+        if isinstance(item, dict):
+            # Common TGI fields
+            for key in ("generated_text", "output_text", "text"):
+                val = item.get(key)
+                if isinstance(val, str):
+                    return val
+            gen = item.get("generated")
+            if isinstance(gen, str):
+                return gen
+            outputs = item.get("outputs")
+            if isinstance(outputs, list) and outputs and isinstance(outputs[0], dict):
+                txt = outputs[0].get("text")
+                if isinstance(txt, str):
+                    return txt
+        return None
+    except Exception:
+        return None
 
 
 def _fireworks_headers(api_key: str) -> Dict[str, str]:
@@ -160,8 +226,9 @@ def fireworks_call(
     url = host.rstrip("/") + "/v1/completions"
     payload = _fireworks_payload(model, prompt, max_tokens, temperature, top_p, top_k, prompt_cache_max_len)
     headers = _fireworks_headers(api_key)
-    t0 = time.perf_counter()
     try:
+        # Start latency timer strictly at network send to exclude local counting/JSON prep time
+        t0 = time.perf_counter()
         r = session.post(url, headers=headers, data=json.dumps(payload), timeout=timeout_s)
         latency = time.perf_counter() - t0
         if r.status_code >= 200 and r.status_code < 300:
@@ -170,14 +237,36 @@ def fireworks_call(
                 resp_json = r.json()
             except Exception:
                 resp_json = None
-            in_tok = None
+            in_tok = _count_tokens(prompt)
             out_tok = None
             if isinstance(resp_json, dict):
                 usage = resp_json.get("usage") or {}
-                in_tok = usage.get("prompt_tokens")
-                out_tok = usage.get("completion_tokens")
-            return GenResult(latency_s=latency, ok=True, status=r.status_code, error=None,
-                             response_input_tokens=in_tok, response_output_tokens=out_tok)
+                sv_in = usage.get("prompt_tokens")
+                if isinstance(sv_in, int) and sv_in > 0:
+                    in_tok = sv_in
+                sv_out = usage.get("completion_tokens")
+                if isinstance(sv_out, int) and sv_out >= 0:
+                    out_tok = sv_out
+                if out_tok is None:
+                    # Try to compute from choices[0].text
+                    try:
+                        choices = resp_json.get("choices") or []
+                        text = (choices[0] or {}).get("text") if choices else None
+                        if text:
+                            out_tok = _count_tokens(text)
+                    except Exception:
+                        pass
+            return GenResult(
+                latency_s=latency,
+                ok=True,
+                status=r.status_code,
+                error=None,
+                response_input_tokens=in_tok,
+                response_output_tokens=out_tok,
+                request_prompt_len_chars=len(prompt) if isinstance(prompt, str) else None,
+                measured_input_tokens=_count_tokens(prompt),
+                measured_output_tokens=_count_tokens(((resp_json.get("choices") or [{}])[0].get("text")) if isinstance(resp_json, dict) else None),
+            )
         return GenResult(latency_s=latency, ok=False, status=r.status_code, error=r.text[:2000])
     except Exception as e:
         latency = time.perf_counter() - t0
@@ -250,7 +339,10 @@ class SageMakerInvoker:
                     "min_new_tokens": max_tokens,
                     "temperature": temperature,
                     "top_p": top_p,
+                    "details": True,
                 },
+                # Request token-level details so we can log input/output tokens
+                "details": True,
                 "stream": False,
             }
             if top_k is not None:
@@ -267,7 +359,6 @@ class SageMakerInvoker:
             }
             if top_k is not None:
                 payload["top_k"] = top_k
-        t0 = time.perf_counter()
         try:
             # boto3 doesn't expose a direct per-request timeout; rely on client config/env for network timeouts
             invoke_kwargs = dict(
@@ -280,6 +371,11 @@ class SageMakerInvoker:
                 invoke_kwargs["InferenceComponentName"] = self.inference_component_name
                 if self.debug:
                     print(f"[debug] invoking IC endpoint with component={self.inference_component_name}")
+            # Store prompt token count just before send (client-side), independent of server response
+            client_side_in_tokens = _count_tokens(prompt)
+
+            # Start latency timer strictly at network send to exclude local counting/JSON prep time
+            t0 = time.perf_counter()
             resp = self.runtime.invoke_endpoint(**invoke_kwargs)
             # read body to ensure full roundtrip
             body_text = resp["Body"].read().decode()
@@ -293,20 +389,65 @@ class SageMakerInvoker:
                     details = item.get("details") if isinstance(item, dict) else None
                     if isinstance(details, dict):
                         prefill = details.get("prefill")
+                        tokens = details.get("tokens")
+                        gen_tok = details.get("generated_tokens")
+                        # Primary: explicit prefill list
                         if isinstance(prefill, list):
                             in_tok = len(prefill)
-                        out_tok = details.get("generated_tokens")
+                        # Secondary: only derive from tokens if it clearly includes prefill tokens
+                        if in_tok is None and isinstance(tokens, list) and isinstance(gen_tok, int):
+                            if len(tokens) > gen_tok:
+                                in_tok = len(tokens) - gen_tok
+                        # Fallbacks used by some TGI builds
+                        if in_tok is None:
+                            for k in ("prompt_tokens", "input_length", "input_token_count"):
+                                v = details.get(k)
+                                if isinstance(v, int) and v > 0:
+                                    in_tok = v
+                                    break
+                        # Output tokens
+                        if isinstance(gen_tok, int):
+                            out_tok = gen_tok
+                        elif out_tok is None and isinstance(tokens, list) and isinstance(in_tok, int) and len(tokens) >= int(in_tok):
+                            out_tok = max(0, len(tokens) - int(in_tok))
+                        if out_tok is None:
+                            # Last resort: count from generated text fields
+                            gen_text = _extract_tgi_generated_text(parsed)
+                            ct = _count_tokens(gen_text)
+                            if isinstance(ct, int):
+                                out_tok = ct
                 else:
                     # Fireworks container typically returns OpenAI-like JSON with 'usage'
                     if isinstance(parsed, dict):
                         usage = parsed.get("usage") or {}
                         in_tok = usage.get("prompt_tokens")
                         out_tok = usage.get("completion_tokens")
+                        # Derive output tokens if missing using text choices
+                        if out_tok is None:
+                            try:
+                                choices = parsed.get("choices") or []
+                                text = (choices[0] or {}).get("text") if choices else None
+                                ct = _count_tokens(text)
+                                if isinstance(ct, int):
+                                    out_tok = ct
+                            except Exception:
+                                pass
             except Exception:
                 pass
             latency = time.perf_counter() - t0
-            return GenResult(latency_s=latency, ok=True, status=200, error=None,
-                             response_input_tokens=in_tok, response_output_tokens=out_tok)
+            if in_tok is None or in_tok == 0:
+                in_tok = client_side_in_tokens
+            return GenResult(
+                latency_s=latency,
+                ok=True,
+                status=200,
+                error=None,
+                response_input_tokens=in_tok,
+                response_output_tokens=out_tok,
+                request_prompt_len_chars=len(prompt) if isinstance(prompt, str) else None,
+                measured_input_tokens=client_side_in_tokens,
+                measured_output_tokens=_count_tokens(_extract_tgi_generated_text(parsed)) if self.api_mode == "tgi" else _count_tokens(((json.loads(body_text).get("choices") or [{}])[0].get("text")) if body_text else None),
+            )
         except Exception as e:
             latency = time.perf_counter() - t0
             return GenResult(latency_s=latency, ok=False, status=None, error=str(e))
@@ -436,15 +577,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     p.add_argument("--prompt-tokens", type=int, default=512)
     p.add_argument("--max-tokens", type=int, default=128)
+    # Aliases for convenience (input/output length)
+    p.add_argument("--input-len", type=int, default=None, help="Alias for --prompt-tokens")
+    p.add_argument("--output-len", type=int, default=None, help="Alias for --max-tokens")
     p.add_argument("--temperature", type=float, default=1.0)
     p.add_argument("--top-p", type=float, default=0.9)
     p.add_argument("--top-k", type=int, default=None)
     p.add_argument("--prompt-cache-max-len", type=int, default=0)
+    p.add_argument("--tokenizer-id", type=str, default=None,
+                   help="Optional HF tokenizer id for client-side token counting (e.g., Qwen/Qwen3-8B)")
     p.add_argument("--prompt-randomize", action="store_true", help="Randomize prompt pad region to avoid caching")
 
     p.add_argument("--qps-list", required=True, help="Comma-separated QPS values, e.g. 0.5,1,2,5,10")
     p.add_argument("--duration-per-qps", type=float, default=20.0, help="Seconds to run at each QPS")
-    p.add_argument("--max-workers", type=int, default=100, help="Thread pool size")
+    p.add_argument("--max-workers", type=int, default=200, help="Thread pool size (default sized for up to ~200 QPS with ~2s latency)")
     p.add_argument("--requests-timeout", type=int, default=60, help="Per-request timeout in seconds (HTTP only)")
 
     p.add_argument("--results-dir", default="results", help="Directory to write results and plots")
@@ -459,6 +605,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
 
     args = p.parse_args(argv)
+    # Normalize aliases if provided
+    if getattr(args, "input_len", None) is not None:
+        args.prompt_tokens = args.input_len
+    if getattr(args, "output_len", None) is not None:
+        args.max_tokens = args.output_len
 
     fireworks_api_key = args.fireworks_api_key or os.getenv("FIREWORKS_API_KEY")
 
@@ -514,6 +665,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     rows: List[Dict[str, Any]] = []
     # Per-request log entries for post-run token distribution checks
     req_logs: List[Dict[str, Any]] = []
+
+    # Prepare client-side tokenizer if requested
+    desired_tok_id = args.tokenizer_id or os.getenv("DEFAULT_TOKENIZER_ID") or "Qwen/Qwen3-8B"
+    if AutoTokenizer is not None and desired_tok_id:
+        try:
+            tok = AutoTokenizer.from_pretrained(desired_tok_id, use_fast=True)
+            def _count_text_tokens(s: str) -> int:
+                return len(tok.encode(s))
+            thread_local_context.token_count_fn = _count_text_tokens
+            if args.debug:
+                print(f"[debug] Loaded tokenizer for counting: {desired_tok_id}")
+        except Exception as e:
+            if args.debug:
+                print(f"[debug] Failed to load tokenizer '{desired_tok_id}': {e}")
 
     print("Starting benchmark...\n")
     print(f"QPS values: {qps_values}")
@@ -633,8 +798,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         "ok": r.ok,
                         "status": r.status,
                         "latency_ms": r.latency_s * 1000.0,
-                        "input_tokens": r.response_input_tokens,
-                        "output_tokens": r.response_output_tokens,
+                        # Prefer server counts; fallback to measured; fallback to configured shape
+                        "input_tokens": (
+                            r.response_input_tokens
+                            if (r.response_input_tokens is not None and r.response_input_tokens > 0)
+                            else (r.measured_input_tokens if r.measured_input_tokens is not None else args.prompt_tokens)
+                        ),
+                        "output_tokens": (
+                            r.response_output_tokens
+                            if (r.response_output_tokens is not None and r.response_output_tokens >= 0)
+                            else (r.measured_output_tokens if r.measured_output_tokens is not None else args.max_tokens)
+                        ),
                     }
                 )
 
